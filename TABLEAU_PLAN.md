@@ -497,6 +497,82 @@ Pivot sites to instrument: `add_constraint` (post-substitute), `optimise` (per
 loop iteration), `dual_optimise` (per iteration), `add_with_artificial_variable`
 (entry/exit), `remove_constraint` (post `remove_marker_effects`).
 
+## 7c. Phase 2 status: implemented, and what it turned up
+
+**Done.** `Trace` / `TraceStep` / `TraceEvent` / `Phase` in `src/tableau.rs`, the
+gated `start_trace` / `stop_trace` / `take_trace` / `is_tracing` accessors and
+their internal hooks in `src/solver_impl.rs`, `examples/trace.rs`, and
+`tests/trace.rs` (16 tests). All 27 feature tests and both pre-existing tests
+pass, with and without the feature; still no new compiler warnings beyond the
+crate's 12 pre-existing ones. 60 consecutive full-suite runs, no flakes.
+
+Six things the build settled, several of them corrections to the plan above:
+
+1. **The recording buffer beat the closure hook, for a different reason than
+   expected.** The plan's stated borrow hazard — `optimise` holding
+   `objective.borrow_mut()` across the loop — *does not exist*. The loop writes
+   `Solver::get_entering_symbol(&objective.borrow())`, whose temporary `Ref` is
+   dropped at the end of that statement, so no borrow is live at the pivot site.
+   And `tableau()` only ever takes *shared* borrows, which `RefCell` grants
+   freely, so even a live shared borrow would be harmless.
+
+   The real conflict is `Option<Box<dyn FnMut(TraceEvent, &Tableau)>>` stored in
+   `Solver`: invoking it needs `&mut self.trace` while building the snapshot
+   needs `&self`. That forces a take-and-replace dance on every call. The
+   buffer has no such problem — `trace_snapshot(&self)` and `trace_push(&mut
+   self)` simply run in sequence — so the "simpler fallback" is what shipped.
+   `snapshot(&Row, ...)` was kept anyway; it costs nothing and `tableau()`
+   delegates to it.
+
+2. **Snapshots are taken *before* each pivot, not after.** This was not in the
+   plan and matters more than it sounds. `get_leaving_row` **removes** the
+   leaving row from `self.rows` before returning it, so a snapshot taken after
+   the pivot is chosen is missing a basis row. Taking it before the call also
+   makes each step read like a textbook iteration: the tableau, the entering
+   column marked `*`, the leaving row marked `<`, the ratio test filled in, and
+   the pivot element named. The result of that pivot is the next step's tableau.
+   `dual_optimise` needs the same treatment for the same reason.
+
+3. **The artificial-variable heuristic was replaceable, and is now gone.**
+   §7b and the original module docs identified artificials heuristically ("a
+   slack belonging to no constraint tag"). That is wrong after
+   `remove_constraint`, which deletes the tag before snapshotting — every slack
+   marker of the removed constraint would render as `a7` rather than `s7`. The
+   solver already knows the answer, so a gated `artificial_symbol: Option<Symbol>`
+   field now records it for the duration of `add_with_artificial_variable`. The
+   label is exact, and `Artificial` correctly appears only in phase-I snapshots.
+   This also removed the `tagged` set from the snapshot path entirely
+   (`costs_and_tags` → `symbol_costs`).
+
+4. **The dual ratio test runs along a row, not down a column.** It therefore
+   cannot use `TableauRow::ratio`. `Tableau::dual_ratios` is parallel to
+   `columns` and renders as a row under the reduced costs.
+
+5. **Forcing phase I is harder than it looks** — worth recording, because the
+   first three attempts at a test for it passed *vacuously*. `create_row` ends
+   with "ensure the row has a positive constant", flipping the sign of any row
+   whose constant is negative. That flip usually leaves the marker slack
+   negative, which is exactly what `choose_subject` wants, so mixed-direction
+   bounds (`a >= 10` then `a <= 20`) and redundant equalities never reach
+   `add_with_artificial_variable`. What does reach it is **two bounds in the
+   same direction**: after `a >= 10` is basic, the row for `a >= 20` reduces to
+   slacks only with the marker positive — no subject, so phase I runs. Note this
+   is a pattern a UI layout generates constantly (stacked `Constraint::Min`s),
+   so phase I is not an exotic path in ratatui's usage.
+
+6. **The dual trace is the interesting one for UI layout.** `suggest_value` runs
+   *no primal iterations at all*: it shifts the right-hand side in place and
+   repairs feasibility with dual pivots. `examples/trace.rs` part 2 shows a
+   300px resize costing two dual pivots. That is the whole reason cassowary is
+   fast enough to re-layout on every frame, and it is invisible without tracing.
+
+Not asserted anywhere, deliberately: the pivot *sequence*. `get_entering_symbol`
+takes the first negative-cost symbol out of a `HashMap`, so the route to the
+optimum varies per process. Every test in `tests/trace.rs` asserts a *property*
+of whatever sequence a run produces — entering column has negative reduced cost,
+leaving row attains the minimum ratio, consecutive snapshots are linked by the
+pivot the earlier one marks — never a specific sequence.
+
 ### Phase 3 — ratatui bridge
 
 An example, `examples/ratatui_layout.rs`, that reconstructs the constraint set
@@ -618,7 +694,9 @@ Round before casting. Cassowary's arithmetic produces near-integers constantly.
   vector — it is the *original* cost, shown for pedagogical continuity (§0c).
 - There is no explicit `A`, `B` or `B⁻¹` to display: the tableau is permanently
   stored in `B⁻¹`-multiplied form and updated in place by `substitute` (§1.1).
-- Artificial variables are typed as `Slack` and are heuristically identified.
+- Artificial variables are typed as `Slack`; they are identified exactly, from
+  the symbol the solver records for the duration of phase I (§7c.3), so the
+  `Artificial` label appears only in phase-I snapshots.
 - The solver's carried objective constant drifts across `suggest_value`; `z` is
   computed from the basis instead (§7b.2).
 - A negative reduced cost under a `Dummy` column does not indicate
@@ -628,3 +706,8 @@ Round before casting. Cassowary's arithmetic produces near-integers constantly.
   between runs even though the final solution is valid. Traces are therefore
   not reproducible across processes, only within one. This is the same
   nondeterminism the crate docs warn about at window width 75.
+- A trace snapshots the whole tableau at every pivot, so it is a debugging
+  facility, not something to leave enabled.
+- `Pivot` and `DualPivot` steps hold the tableau *before* the pivot, marked with
+  the element about to be pivoted on (§7c.2); every other event holds the state
+  at the moment it is named.

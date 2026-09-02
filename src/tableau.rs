@@ -28,8 +28,14 @@
 //!   REQUIRED equality and must stay nonbasic at zero, so `get_entering_symbol`
 //!   skips it. A negative reduced cost under a dummy column does not mean the
 //!   tableau is suboptimal.
-//! * Artificial variables are created with `SymbolType::Slack` and are
-//!   identified heuristically (basic, but belonging to no constraint tag).
+//! * Artificial variables are created with `SymbolType::Slack`, so the type
+//!   alone cannot distinguish one. The solver records the live artificial
+//!   symbol while `add_with_artificial_variable` runs, and snapshots use that -
+//!   so the `Artificial` label is exact, and appears only in phase-I snapshots
+//!   (an artificial is purged from the tableau before that call returns).
+//! * `Solver::tableau` only ever sees the state *between* calls. The pivots
+//!   themselves happen inside `add_constraint`, `remove_constraint` and
+//!   `suggest_value`. `Solver::start_trace` records them - see `Trace`.
 //! * The solver's carried objective constant is **not** the objective value
 //!   after a `suggest_value`: that call encodes a new right-hand side by
 //!   shifting row constants directly, with no matching correction to the
@@ -41,8 +47,8 @@ use std::fmt;
 
 use {Row, Symbol, SymbolType, Variable, near_zero};
 
-/// Public mirror of the crate-private `SymbolType`, plus a heuristic
-/// `Artificial` case that the private enum does not distinguish.
+/// Public mirror of the crate-private `SymbolType`, plus an `Artificial` case
+/// that the private enum does not distinguish (artificials are typed `Slack`).
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum SymbolKind {
     External,
@@ -153,6 +159,19 @@ pub struct Tableau {
     pub edits: Vec<EditView>,
     /// External variables that are not basic, and therefore zero.
     pub nonbasic_externals: Vec<String>,
+    /// Entering column of the pivot this snapshot is about to undergo, set on
+    /// the pre-pivot snapshots a trace records. `None` outside a trace.
+    pub pivot_col: Option<usize>,
+    /// Leaving row of that pivot.
+    pub pivot_row: Option<usize>,
+    /// Dual ratio test results, parallel to `columns`, populated by
+    /// `compute_dual_ratios`.
+    pub dual_ratios: Option<Vec<Option<f64>>>,
+    /// Raw symbol ids behind `columns`, so a pivot can be located by symbol
+    /// rather than by display name. Ids are unique across symbol types.
+    pub(crate) column_ids: Vec<usize>,
+    /// Raw symbol ids behind `rows`.
+    pub(crate) row_ids: Vec<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,16 +194,26 @@ fn symbol_name(
     format!("{}{}", kind.prefix(), s.0)
 }
 
-fn kind_of(s: Symbol, tagged: &HashSet<Symbol>) -> SymbolKind {
-    let k = SymbolKind::from_type(s.type_());
-    // Artificial variables are created as `SymbolType::Slack` in
-    // `add_with_artificial_variable`, so type alone cannot distinguish them.
-    // A slack belonging to no constraint tag is one. Heuristic.
-    if k == SymbolKind::Slack && !tagged.contains(&s) {
+/// `artificial` is the artificial variable currently in the basis, if any.
+/// Artificial variables are created with `SymbolType::Slack`, so the type alone
+/// cannot distinguish one; the solver tracks the symbol itself instead.
+fn kind_of(s: Symbol, artificial: Option<Symbol>) -> SymbolKind {
+    if artificial == Some(s) {
         SymbolKind::Artificial
     } else {
-        k
+        SymbolKind::from_type(s.type_())
     }
+}
+
+/// Display name for a symbol, matching the names a snapshot uses for the same
+/// symbol.
+pub(crate) fn label_symbol(
+    s: Symbol,
+    artificial: Option<Symbol>,
+    var_for_symbol: &HashMap<Symbol, Variable>,
+    names: &HashMap<Variable, String>,
+) -> String {
+    symbol_name(s, kind_of(s, artificial), var_for_symbol, names)
 }
 
 pub(crate) fn build(
@@ -192,7 +221,7 @@ pub(crate) fn build(
     objective: &Row,
     artificial: Option<&Row>,
     costs: &HashMap<Symbol, f64>,
-    tagged: &HashSet<Symbol>,
+    artificial_symbol: Option<Symbol>,
     var_for_symbol: &HashMap<Symbol, Variable>,
     names: &HashMap<Variable, String>,
     infeasible: &[Symbol],
@@ -218,12 +247,12 @@ pub(crate) fn build(
     }
 
     let mut cols: Vec<Symbol> = nonbasic.into_iter().collect();
-    cols.sort_by_key(|s| (kind_of(*s, tagged).rank(), s.0));
+    cols.sort_by_key(|s| (kind_of(*s, artificial_symbol).rank(), s.0));
 
     let columns: Vec<ColumnHeader> = cols
         .iter()
         .map(|s| {
-            let kind = kind_of(*s, tagged);
+            let kind = kind_of(*s, artificial_symbol);
             ColumnHeader {
                 name: symbol_name(*s, kind, var_for_symbol, names),
                 kind: kind,
@@ -233,7 +262,7 @@ pub(crate) fn build(
         .collect();
 
     let mut basis: Vec<Symbol> = rows.keys().cloned().collect();
-    basis.sort_by_key(|s| (kind_of(*s, tagged).rank(), s.0));
+    basis.sort_by_key(|s| (kind_of(*s, artificial_symbol).rank(), s.0));
 
     let infeasible_set: HashSet<Symbol> = infeasible.iter().cloned().collect();
 
@@ -241,7 +270,7 @@ pub(crate) fn build(
         .iter()
         .map(|s| {
             let row = &rows[s];
-            let kind = kind_of(*s, tagged);
+            let kind = kind_of(*s, artificial_symbol);
             TableauRow {
                 basis: symbol_name(*s, kind, var_for_symbol, names),
                 kind: kind,
@@ -278,6 +307,11 @@ pub(crate) fn build(
         phase_one: phase_one,
         edits: edits,
         nonbasic_externals: nonbasic_externals,
+        pivot_col: None,
+        pivot_row: None,
+        dual_ratios: None,
+        column_ids: cols.iter().map(|s| s.0).collect(),
+        row_ids: basis.iter().map(|s| s.0).collect(),
     }
 }
 
@@ -324,6 +358,68 @@ impl Tableau {
             } else {
                 None
             };
+        }
+    }
+
+    /// Fill in the dual ratio row for a given leaving row, mirroring
+    /// `Solver::get_dual_entering_symbol`: a column can enter only if it is
+    /// non-dummy and its coefficient in the leaving row is *positive*, and the
+    /// entering column is the one minimising `reduced_cost / coefficient`.
+    ///
+    /// Note this ratio runs along a row, not down a column, which is why it is
+    /// stored parallel to `columns` rather than in `TableauRow::ratio`.
+    pub fn compute_dual_ratios(&mut self, leaving_row: usize) {
+        let ratios: Vec<Option<f64>> = {
+            let row = &self.rows[leaving_row];
+            (0..self.columns.len())
+                .map(|j| {
+                    if self.columns[j].kind != SymbolKind::Dummy && row.coeffs[j] > 0.0 {
+                        Some(self.objective.reduced[j] / row.coeffs[j])
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        self.dual_ratios = Some(ratios);
+    }
+
+    /// Locate a symbol id among the columns.
+    pub(crate) fn column_of_id(&self, id: usize) -> Option<usize> {
+        self.column_ids.iter().position(|&i| i == id)
+    }
+
+    /// Locate a symbol id among the basis rows.
+    pub(crate) fn row_of_id(&self, id: usize) -> Option<usize> {
+        self.row_ids.iter().position(|&i| i == id)
+    }
+
+    /// Mark the primal pivot this snapshot is about to undergo, and run the
+    /// minimum-ratio test on the entering column.
+    pub(crate) fn mark_pivot(&mut self, entering_id: usize, leaving_id: usize) {
+        self.pivot_col = self.column_of_id(entering_id);
+        self.pivot_row = self.row_of_id(leaving_id);
+        if let Some(c) = self.pivot_col {
+            self.compute_ratios(c);
+        }
+    }
+
+    /// Mark the dual pivot this snapshot is about to undergo, and run the dual
+    /// ratio test along the leaving row.
+    pub(crate) fn mark_dual_pivot(&mut self, entering_id: usize, leaving_id: usize) {
+        self.pivot_col = self.column_of_id(entering_id);
+        self.pivot_row = self.row_of_id(leaving_id);
+        if let Some(r) = self.pivot_row {
+            self.compute_dual_ratios(r);
+        }
+    }
+
+    /// The coefficient the pivot will divide through by, in dictionary signs.
+    /// `None` unless both `pivot_row` and `pivot_col` are set.
+    pub fn pivot_element(&self) -> Option<f64> {
+        match (self.pivot_row, self.pivot_col) {
+            (Some(r), Some(c)) => Some(self.rows[r].coeffs[c]),
+            _ => None,
         }
     }
 
@@ -562,7 +658,15 @@ impl Tableau {
         }
 
         let mut hdr: Vec<String> = vec!["Basis".to_string(), "CB".to_string()];
-        hdr.extend(live.iter().map(|&j| self.columns[j].name.clone()));
+        // A trailing `*` marks the entering column of the pivot this snapshot
+        // is about to undergo.
+        hdr.extend(live.iter().map(|&j| {
+            if self.pivot_col == Some(j) {
+                format!("{}*", self.columns[j].name)
+            } else {
+                self.columns[j].name.clone()
+            }
+        }));
         hdr.push("b".to_string());
         if want_ratio {
             hdr.push("ratio".to_string());
@@ -574,9 +678,15 @@ impl Tableau {
         lines.push(Line::Cells(hdr));
         lines.push(Line::Sep);
 
-        for r in &self.rows {
+        for (i, r) in self.rows.iter().enumerate() {
             let mut cells = vec![
-                format!("{}{}", r.basis, if r.infeasible { " !" } else { "" }),
+                format!(
+                    "{}{}{}",
+                    r.basis,
+                    if r.infeasible { " !" } else { "" },
+                    // A trailing `<` marks the leaving row of the pending pivot.
+                    if self.pivot_row == Some(i) { " <" } else { "" }
+                ),
                 fmt_strength(r.c_b, opts),
             ];
             cells.extend(live.iter().map(|&j| fmt_num(sign * r.coeffs[j], opts)));
@@ -623,7 +733,46 @@ impl Tableau {
         lines.push(Line::Cells(cells));
         lines.push(Line::Sep);
 
+        // The dual ratio test runs along the leaving row, so it prints as a
+        // row beneath the reduced costs rather than as the `ratio` column.
+        if let Some(ref dr) = self.dual_ratios {
+            let mut cells = vec!["dual ratio".to_string(), String::new()];
+            cells.extend(live.iter().map(|&j| match dr[j] {
+                Some(v) => fmt_num(v, opts),
+                None => "-".to_string(),
+            }));
+            cells.push(String::new());
+            if want_ratio {
+                cells.push(String::new());
+            }
+            lines.push(Line::Cells(cells));
+            lines.push(Line::Sep);
+        }
+
         let mut out = grid(&lines, ncols);
+
+        if self.pivot_col.is_some() || self.pivot_row.is_some() {
+            let entering = self
+                .pivot_col
+                .map(|j| self.columns[j].name.as_str())
+                .unwrap_or("?");
+            let leaving = self
+                .pivot_row
+                .map(|i| self.rows[i].basis.as_str())
+                .unwrap_or("?");
+            out.push_str(&format!(
+                "  pivot: {}* enters, {} < leaves",
+                entering, leaving
+            ));
+            match self.pivot_element() {
+                Some(p) => out.push_str(&format!(
+                    ", pivot element = {}\n",
+                    fmt_num(sign * p, opts)
+                )),
+                None => out.push('\n'),
+            }
+            out.push_str("  (this tableau is the state *before* that pivot)\n");
+        }
 
         if let Some(ref p1) = self.phase_one {
             out.push_str(&format!(
@@ -671,6 +820,212 @@ impl Tableau {
 }
 
 impl fmt::Display for Tableau {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.render(&RenderOpts::default()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Step tracing
+// ---------------------------------------------------------------------------
+
+/// Which simplex phase a pivot belongs to.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Phase {
+    /// Driving an artificial variable out of the basis, inside
+    /// `add_with_artificial_variable`. The objective being minimised is the
+    /// artificial row, not the real one.
+    One,
+    /// Minimising the real objective.
+    Two,
+}
+
+impl Phase {
+    pub fn label(&self) -> &'static str {
+        match *self {
+            Phase::One => "phase I",
+            Phase::Two => "phase II",
+        }
+    }
+}
+
+/// What the solver was doing when a `TraceStep` was captured.
+///
+/// Symbols are carried as display names rather than `Symbol`s, which are
+/// crate-private. Names match the ones in the accompanying `Tableau`.
+#[derive(Clone, Debug)]
+pub enum TraceEvent {
+    /// `add_constraint` created a row and solved it for `subject`, which is now
+    /// basic. Captured before the optimisation that follows.
+    SubjectChosen { subject: String },
+    /// No subject could be chosen, so `add_with_artificial_variable` put
+    /// `artificial` into the basis and started phase I.
+    ArtificialPhaseStart { artificial: String },
+    /// Phase I finished. `success` is whether the artificial objective reached
+    /// zero, i.e. whether the constraint was satisfiable.
+    ArtificialPhaseEnd { success: bool },
+    /// A primal pivot chosen by `optimise`. The snapshot is *pre-pivot*.
+    Pivot {
+        entering: String,
+        leaving: String,
+        phase: Phase,
+    },
+    /// `optimise` found no column with a negative reduced cost and returned.
+    Optimal { phase: Phase },
+    /// `suggest_value` shifted the right-hand side. Rows driven negative are
+    /// marked infeasible and the dual pivots below follow.
+    ValueSuggested { variable: String, value: f64 },
+    /// A dual pivot chosen by `dual_optimise`. The snapshot is *pre-pivot*.
+    DualPivot { entering: String, leaving: String },
+    /// `dual_optimise` drained its infeasible queue.
+    Feasible,
+    /// `remove_constraint` pivoted a marker out of the basis and dropped its
+    /// row. Captured before the re-optimisation that follows.
+    MarkerRemoved { marker: String },
+}
+
+impl TraceEvent {
+    /// A one-line description, used as the step header when rendering.
+    pub fn describe(&self) -> String {
+        match *self {
+            TraceEvent::SubjectChosen { ref subject } => {
+                format!("row added, solved for {}", subject)
+            }
+            TraceEvent::ArtificialPhaseStart { ref artificial } => format!(
+                "phase I begins: artificial variable {} entered the basis",
+                artificial
+            ),
+            TraceEvent::ArtificialPhaseEnd { success } => format!(
+                "phase I ends: artificial objective {}",
+                if success {
+                    "reached zero (constraint satisfiable)"
+                } else {
+                    "did not reach zero (constraint unsatisfiable)"
+                }
+            ),
+            TraceEvent::Pivot {
+                ref entering,
+                ref leaving,
+                phase,
+            } => format!(
+                "{} pivot: {} enters, {} leaves",
+                phase.label(),
+                entering,
+                leaving
+            ),
+            TraceEvent::Optimal { phase } => format!(
+                "{} optimal: no non-dummy column has a negative reduced cost",
+                phase.label()
+            ),
+            TraceEvent::ValueSuggested {
+                ref variable,
+                value,
+            } => format!(
+                "suggest_value({}, {}): right-hand side shifted",
+                variable, value
+            ),
+            TraceEvent::DualPivot {
+                ref entering,
+                ref leaving,
+            } => format!(
+                "dual pivot: {} leaves (infeasible), {} enters",
+                leaving, entering
+            ),
+            TraceEvent::Feasible => "dual simplex done: no infeasible rows remain".to_string(),
+            TraceEvent::MarkerRemoved { ref marker } => format!(
+                "constraint removed: marker {} pivoted out and its row dropped",
+                marker
+            ),
+        }
+    }
+
+    /// Whether this event is a pivot, primal or dual.
+    pub fn is_pivot(&self) -> bool {
+        match *self {
+            TraceEvent::Pivot { .. } | TraceEvent::DualPivot { .. } => true,
+            _ => false,
+        }
+    }
+}
+
+/// One recorded moment: what happened, and the tableau at that moment.
+#[derive(Clone, Debug)]
+pub struct TraceStep {
+    pub event: TraceEvent,
+    /// The tableau when the event was captured.
+    ///
+    /// For `Pivot` and `DualPivot` this is the tableau **before** the pivot is
+    /// applied, with `Tableau::pivot_col` and `pivot_row` marking the chosen
+    /// element and the relevant ratio test filled in. So a pivot step reads as
+    /// "here is the tableau, and here is the pivot about to happen"; the result
+    /// of that pivot is the tableau of the next step. Every other event
+    /// captures the state at the moment it is named.
+    pub tableau: Tableau,
+}
+
+impl TraceStep {
+    pub fn render(&self, opts: &RenderOpts) -> String {
+        format!("{}\n{}", self.event.describe(), self.tableau.render(opts))
+    }
+}
+
+/// A recording of the solver's pivots.
+///
+/// Start one with `Solver::start_trace`, and take it back with
+/// `Solver::take_trace` or `Solver::stop_trace`.
+///
+/// **The pivot sequence is not reproducible across processes.**
+/// `Solver::get_entering_symbol` takes the first negative-cost symbol out of a
+/// `HashMap`, whose iteration order is randomised per process, so two runs of
+/// the same program can reach the same optimum by different routes. Within one
+/// process a trace is exact.
+#[derive(Clone, Debug)]
+pub struct Trace {
+    pub steps: Vec<TraceStep>,
+    pub(crate) names: HashMap<Variable, String>,
+}
+
+impl Trace {
+    pub(crate) fn new(names: HashMap<Variable, String>) -> Trace {
+        Trace {
+            steps: Vec::new(),
+            names: names,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// Just the pivot steps, primal and dual.
+    pub fn pivots(&self) -> Vec<&TraceStep> {
+        self.steps.iter().filter(|s| s.event.is_pivot()).collect()
+    }
+
+    /// Render every step in order, numbered.
+    pub fn render(&self, opts: &RenderOpts) -> String {
+        let mut out = String::new();
+        let n = self.steps.len();
+        for (i, step) in self.steps.iter().enumerate() {
+            out.push_str(&format!(
+                "--- step {} of {}: {} {}\n",
+                i + 1,
+                n,
+                step.event.describe(),
+                "-".repeat(8)
+            ));
+            out.push_str(&step.tableau.render(opts));
+            out.push('\n');
+        }
+        out
+    }
+}
+
+impl fmt::Display for Trace {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.render(&RenderOpts::default()))
     }

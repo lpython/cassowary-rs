@@ -28,3 +28,7 @@ required-features = ["tableau"]
 [[example]]
 name = "two_box"
 required-features = ["tableau"]
+
+[[example]]
+name = "trace"
+required-features = ["tableau"]

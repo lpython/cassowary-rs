@@ -47,7 +47,19 @@ pub struct Solver {
     infeasible_rows: Vec<Symbol>, // never contains external symbols
     objective: Rc<RefCell<Row>>,
     artificial: Option<Rc<RefCell<Row>>>,
-    id_tick: usize
+    id_tick: usize,
+    /// Pivot recorder, `None` unless `start_trace` has been called. Boxed so
+    /// that `trace_push` can move it out of `self` and back, sidestepping the
+    /// borrow conflict between snapshotting (`&self`) and recording (`&mut
+    /// self`).
+    #[cfg(feature = "tableau")]
+    trace: Option<Box<::tableau::Trace>>,
+    /// The artificial variable currently in the basis, live only for the
+    /// duration of `add_with_artificial_variable`. Recorded so that snapshots
+    /// can identify it exactly: artificial variables are created with
+    /// `SymbolType::Slack`, so the type alone cannot distinguish one.
+    #[cfg(feature = "tableau")]
+    artificial_symbol: Option<Symbol>
 }
 
 impl Solver {
@@ -65,7 +77,11 @@ impl Solver {
             infeasible_rows: Vec::new(),
             objective: Rc::new(RefCell::new(Row::new(0.0))),
             artificial: None,
-            id_tick: 1
+            id_tick: 1,
+            #[cfg(feature = "tableau")]
+            trace: None,
+            #[cfg(feature = "tableau")]
+            artificial_symbol: None
         }
     }
 
@@ -128,6 +144,16 @@ impl Solver {
 
         self.cns.insert(constraint, tag);
 
+        // Recorded after `cns.insert`, so the snapshot can attribute the new
+        // constraint's error symbols their cost.
+        #[cfg(feature = "tableau")]
+        {
+            if self.trace.is_some() && subject.type_() != SymbolType::Invalid {
+                let subject = self.trace_label(subject);
+                self.trace_event(::tableau::TraceEvent::SubjectChosen { subject: subject });
+            }
+        }
+
         // Optimizing after each constraint is added performs less
         // aggregate work due to a smaller average system size. It
         // also ensures the solver remains in a consistent state.
@@ -154,6 +180,14 @@ impl Solver {
                                              "Failed to find leaving row.")));
             row.solve_for_symbols(leaving, tag.marker);
             self.substitute(tag.marker, &row);
+        }
+
+        #[cfg(feature = "tableau")]
+        {
+            if self.trace.is_some() {
+                let marker = self.trace_label(tag.marker);
+                self.trace_event(::tableau::TraceEvent::MarkerRemoved { marker: marker });
+            }
         }
 
         // Optimizing after each constraint is removed ensures that the
@@ -281,6 +315,19 @@ impl Solver {
                         infeasible_rows.push(*symbol);
                     }
                 }
+            }
+        }
+        // Recorded before `dual_optimise`, so the snapshot shows the rows the
+        // shift drove negative still flagged infeasible - the state the dual
+        // pivots that follow are about to repair.
+        #[cfg(feature = "tableau")]
+        {
+            if self.trace.is_some() {
+                let name = self.trace_variable_label(&variable);
+                self.trace_event(::tableau::TraceEvent::ValueSuggested {
+                    variable: name,
+                    value: value
+                });
             }
         }
         try!(self.dual_optimise().map_err(|e| SuggestValueError::InternalSolverError(e.0)));
@@ -491,6 +538,17 @@ impl Solver {
         self.rows.insert(art, Box::new(row.clone()));
         self.artificial = Some(Rc::new(RefCell::new(row.clone())));
 
+        #[cfg(feature = "tableau")]
+        {
+            self.artificial_symbol = Some(art);
+            if self.trace.is_some() {
+                let name = self.trace_label(art);
+                self.trace_event(::tableau::TraceEvent::ArtificialPhaseStart {
+                    artificial: name
+                });
+            }
+        }
+
         // Optimize the artificial objective. This is successful
         // only if the artificial objective is optimized to zero.
         let artificial = self.artificial.as_ref().unwrap().clone();
@@ -502,10 +560,15 @@ impl Solver {
         // it becomes basic. If the row is constant, exit early.
         if let Some(mut row) = self.rows.remove(&art) {
             if row.cells.is_empty() {
+                #[cfg(feature = "tableau")]
+                { self.trace_event(::tableau::TraceEvent::ArtificialPhaseEnd { success: success });
+                  self.artificial_symbol = None; }
                 return Ok(success);
             }
             let entering = Solver::any_pivotable_symbol(&row); // never External
             if entering.type_() == SymbolType::Invalid {
+                #[cfg(feature = "tableau")]
+                { self.artificial_symbol = None; }
                 return Ok(false); // unsatisfiable (will this ever happen?)
             }
             row.solve_for_symbols(art, entering);
@@ -518,6 +581,13 @@ impl Solver {
             row.remove(art);
         }
         self.objective.borrow_mut().remove(art);
+        #[cfg(feature = "tableau")]
+        {
+            // Recorded while `artificial_symbol` is still set, so the closing
+            // snapshot labels the (now purged) artificial consistently.
+            self.trace_event(::tableau::TraceEvent::ArtificialPhaseEnd { success: success });
+            self.artificial_symbol = None;
+        }
         Ok(success)
     }
 
@@ -555,10 +625,19 @@ impl Solver {
         loop {
             let entering = Solver::get_entering_symbol(&objective.borrow());
             if entering.type_() == SymbolType::Invalid {
+                #[cfg(feature = "tableau")]
+                { let phase = self.trace_phase();
+                  self.trace_event(::tableau::TraceEvent::Optimal { phase: phase }); }
                 return Ok(());
             }
+            // Snapshot before `get_leaving_row`, which removes the leaving row
+            // from the basis; afterwards the tableau would be missing a row.
+            #[cfg(feature = "tableau")]
+            let pending = self.trace_snapshot();
             let (leaving, mut row) = try!(self.get_leaving_row(entering)
                              .ok_or(InternalSolverError("The objective is unbounded")));
+            #[cfg(feature = "tableau")]
+            self.trace_pivot(pending, entering, leaving);
             // pivot the entering symbol into the basis
             row.solve_for_symbols(leaving, entering);
             self.substitute(entering, &row);
@@ -577,8 +656,16 @@ impl Solver {
     /// an iteration of the dual simplex method to make the solution both
     /// optimal and feasible.
     fn dual_optimise(&mut self) -> Result<(), InternalSolverError> {
+        #[cfg(feature = "tableau")]
+        let mut pivoted = false;
         while !self.infeasible_rows.is_empty() {
             let leaving = self.infeasible_rows.pop().unwrap();
+
+            // Snapshot before the leaving row is removed below, for the same
+            // reason as in `optimise`. Discarded if this row turns out to be
+            // feasible after all and no pivot happens.
+            #[cfg(feature = "tableau")]
+            let pending = self.trace_snapshot();
 
             let row = if let Entry::Occupied(entry) = self.rows.entry(leaving) {
                 if entry.get().constant < 0.0 {
@@ -594,6 +681,9 @@ impl Solver {
                 if entering.type_() == SymbolType::Invalid {
                     return Err(InternalSolverError("Dual optimise failed."));
                 }
+                #[cfg(feature = "tableau")]
+                { self.trace_dual_pivot(pending, entering, leaving);
+                  pivoted = true; }
                 // pivot the entering symbol into the basis
                 row.solve_for_symbols(leaving, entering);
                 self.substitute(entering, &row);
@@ -602,6 +692,12 @@ impl Solver {
                     self.var_changed(v);
                 }
                 self.rows.insert(entering, row);
+            }
+        }
+        #[cfg(feature = "tableau")]
+        {
+            if pivoted {
+                self.trace_event(::tableau::TraceEvent::Feasible);
             }
         }
         Ok(())
@@ -799,6 +895,24 @@ impl Solver {
         self.snapshot(&*objective, artificial.as_ref().map(|r| &**r), names)
     }
 
+    /// Reconstruct the original objective coefficient of each symbol.
+    ///
+    /// Basic symbols have been substituted out of the live objective row, so a
+    /// direct lookup there always yields zero. Every error symbol, however, was
+    /// created for exactly one constraint, and its cost is that constraint's
+    /// strength - which the constraint map still holds.
+    fn symbol_costs(&self) -> HashMap<Symbol, f64> {
+        let mut costs: HashMap<Symbol, f64> = HashMap::new();
+        for (cn, tag) in &self.cns {
+            for &s in &[tag.marker, tag.other] {
+                if s.type_() == SymbolType::Error {
+                    costs.insert(s, cn.strength());
+                }
+            }
+        }
+        costs
+    }
+
     /// Build a snapshot from an already-borrowed objective row.
     ///
     /// `optimise` holds `objective.borrow_mut()` across its entire pivot loop,
@@ -809,24 +923,7 @@ impl Solver {
                 artificial: Option<&Row>,
                 names: &HashMap<Variable, String>) -> ::tableau::Tableau
     {
-        // Reconstruct the original objective coefficient of each symbol. Basic
-        // symbols have been substituted out of the live objective row, so a
-        // direct lookup there always yields zero. Every error symbol, however,
-        // was created for exactly one constraint, and its cost is that
-        // constraint's strength - which the constraint map still holds.
-        let mut costs: HashMap<Symbol, f64> = HashMap::new();
-        let mut tagged: HashSet<Symbol> = HashSet::new();
-        for (cn, tag) in &self.cns {
-            for &s in &[tag.marker, tag.other] {
-                if s.type_() == SymbolType::Invalid {
-                    continue;
-                }
-                tagged.insert(s);
-                if s.type_() == SymbolType::Error {
-                    costs.insert(s, cn.strength());
-                }
-            }
-        }
+        let costs = self.symbol_costs();
 
         let edits = self.edits.iter().map(|(v, info)| ::tableau::EditView {
             name: names.get(v).cloned().unwrap_or_else(
@@ -839,10 +936,153 @@ impl Solver {
                          objective,
                          artificial,
                          &costs,
-                         &tagged,
+                         self.artificial_symbol,
                          &self.var_for_symbol,
                          names,
                          &self.infeasible_rows,
                          edits)
+    }
+
+    // -----------------------------------------------------------------------
+    // Step tracing
+    // -----------------------------------------------------------------------
+
+    /// Begin recording every pivot the solver makes.
+    ///
+    /// Snapshots are taken *inside* `add_constraint`, `remove_constraint` and
+    /// `suggest_value`, so the trace shows the pivot sequence those calls run
+    /// internally - which `Solver::tableau` alone cannot, since it only ever
+    /// sees the state between calls.
+    ///
+    /// `names` supplies display names for user variables, as for `tableau`.
+    /// Recording continues until `stop_trace`; it costs a full snapshot per
+    /// pivot, so it is a debugging facility, not something to leave on.
+    ///
+    /// Calling this again discards any steps already recorded.
+    pub fn start_trace(&mut self, names: HashMap<Variable, String>) {
+        self.trace = Some(Box::new(::tableau::Trace::new(names)));
+    }
+
+    /// Whether a trace is currently being recorded.
+    pub fn is_tracing(&self) -> bool {
+        self.trace.is_some()
+    }
+
+    /// Stop recording and return the trace, if one was running.
+    pub fn stop_trace(&mut self) -> Option<::tableau::Trace> {
+        self.trace.take().map(|b| *b)
+    }
+
+    /// Take the steps recorded so far and leave recording enabled, so that the
+    /// next call returns only what happened in between.
+    pub fn take_trace(&mut self) -> Vec<::tableau::TraceStep> {
+        match self.trace.as_mut() {
+            Some(t) => ::std::mem::replace(&mut t.steps, Vec::new()),
+            None => Vec::new()
+        }
+    }
+
+    /// Build a snapshot for the trace, or `None` when not tracing.
+    ///
+    /// Both this and `tableau` take `&self`, so reading the stored names and
+    /// building the snapshot share one immutable borrow. Only `trace_push`
+    /// needs `&mut self`, and it runs afterwards.
+    ///
+    /// Must not be called while `objective.borrow_mut()` is held.
+    fn trace_snapshot(&self) -> Option<::tableau::Tableau> {
+        match self.trace.as_ref() {
+            Some(t) => Some(self.tableau(&t.names)),
+            None => None
+        }
+    }
+
+    /// Record a step whose snapshot has already been built.
+    fn trace_push(&mut self, event: ::tableau::TraceEvent, tableau: Option<::tableau::Tableau>) {
+        if let (Some(t), Some(tab)) = (self.trace.as_mut(), tableau) {
+            t.steps.push(::tableau::TraceStep { event: event, tableau: tab });
+        }
+    }
+
+    /// Snapshot and record together, for events with no pending pivot to mark.
+    fn trace_event(&mut self, event: ::tableau::TraceEvent) {
+        if self.trace.is_none() {
+            return;
+        }
+        let snap = self.trace_snapshot();
+        self.trace_push(event, snap);
+    }
+
+    /// Display name for a symbol, matching the names the snapshot uses.
+    fn trace_label(&self, s: Symbol) -> String {
+        match self.trace.as_ref() {
+            Some(t) => ::tableau::label_symbol(s,
+                                               self.artificial_symbol,
+                                               &self.var_for_symbol,
+                                               &t.names),
+            None => String::new()
+        }
+    }
+
+    /// Display name for a user variable, matching the names a snapshot uses.
+    fn trace_variable_label(&self, v: &Variable) -> String {
+        let named = self.trace.as_ref().and_then(|t| t.names.get(v).cloned());
+        named.unwrap_or_else(|| match self.var_data.get(v) {
+            Some(d) => format!("x{}", (d.1).0),
+            None => "x?".to_string()
+        })
+    }
+
+    /// `optimise` runs the same loop for both phases; the artificial row being
+    /// live is what distinguishes them.
+    fn trace_phase(&self) -> ::tableau::Phase {
+        if self.artificial.is_some() {
+            ::tableau::Phase::One
+        } else {
+            ::tableau::Phase::Two
+        }
+    }
+
+    /// Record a primal pivot. `pending` is the snapshot taken *before*
+    /// `get_leaving_row` removed the leaving row from the basis - taking it
+    /// afterwards would show a tableau with a row missing.
+    fn trace_pivot(&mut self,
+                   pending: Option<::tableau::Tableau>,
+                   entering: Symbol,
+                   leaving: Symbol)
+    {
+        if self.trace.is_none() {
+            return;
+        }
+        let event = ::tableau::TraceEvent::Pivot {
+            entering: self.trace_label(entering),
+            leaving: self.trace_label(leaving),
+            phase: self.trace_phase()
+        };
+        let tab = pending.map(|mut t| {
+            t.mark_pivot(entering.0, leaving.0);
+            t
+        });
+        self.trace_push(event, tab);
+    }
+
+    /// Record a dual pivot, with the dual ratio test filled in along the
+    /// leaving row.
+    fn trace_dual_pivot(&mut self,
+                        pending: Option<::tableau::Tableau>,
+                        entering: Symbol,
+                        leaving: Symbol)
+    {
+        if self.trace.is_none() {
+            return;
+        }
+        let event = ::tableau::TraceEvent::DualPivot {
+            entering: self.trace_label(entering),
+            leaving: self.trace_label(leaving)
+        };
+        let tab = pending.map(|mut t| {
+            t.mark_dual_pivot(entering.0, leaving.0);
+            t
+        });
+        self.trace_push(event, tab);
     }
 }
