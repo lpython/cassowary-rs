@@ -232,6 +232,9 @@ use std::collections::hash_map::{Entry};
 mod solver_impl;
 mod operators;
 
+#[cfg(feature = "tableau")]
+pub mod tableau;
+
 static VARIABLE_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::ATOMIC_USIZE_INIT;
 
 /// Identifies a variable for the constraint solver.

@@ -16,3 +16,15 @@ license = "MIT / Apache-2.0"
 keywords = ["constraint", "simplex", "user", "interface", "layout"]
 
 [dependencies]
+
+[features]
+default = []
+tableau = []
+
+[[example]]
+name = "textbook"
+required-features = ["tableau"]
+
+[[example]]
+name = "two_box"
+required-features = ["tableau"]

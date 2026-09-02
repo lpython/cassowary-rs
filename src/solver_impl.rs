@@ -782,3 +782,67 @@ impl Solver {
         }).unwrap_or(0.0)
     }
 }
+
+#[cfg(feature = "tableau")]
+impl Solver {
+    /// Snapshot the current tableau for inspection.
+    ///
+    /// `names` supplies display names for user variables; symbols without a
+    /// name fall back to `x{id}`. Pass an empty map for no names at all.
+    ///
+    /// This is a pure read. It borrows the objective row, so it must not be
+    /// called from inside a solver method that already holds
+    /// `objective.borrow_mut()` — see `snapshot` for that path.
+    pub fn tableau(&self, names: &HashMap<Variable, String>) -> ::tableau::Tableau {
+        let objective = self.objective.borrow();
+        let artificial = self.artificial.as_ref().map(|a| a.borrow());
+        self.snapshot(&*objective, artificial.as_ref().map(|r| &**r), names)
+    }
+
+    /// Build a snapshot from an already-borrowed objective row.
+    ///
+    /// `optimise` holds `objective.borrow_mut()` across its entire pivot loop,
+    /// so a trace hook firing from within it cannot re-borrow. Taking the row
+    /// as a parameter keeps that path open without reworking this API later.
+    fn snapshot(&self,
+                objective: &Row,
+                artificial: Option<&Row>,
+                names: &HashMap<Variable, String>) -> ::tableau::Tableau
+    {
+        // Reconstruct the original objective coefficient of each symbol. Basic
+        // symbols have been substituted out of the live objective row, so a
+        // direct lookup there always yields zero. Every error symbol, however,
+        // was created for exactly one constraint, and its cost is that
+        // constraint's strength - which the constraint map still holds.
+        let mut costs: HashMap<Symbol, f64> = HashMap::new();
+        let mut tagged: HashSet<Symbol> = HashSet::new();
+        for (cn, tag) in &self.cns {
+            for &s in &[tag.marker, tag.other] {
+                if s.type_() == SymbolType::Invalid {
+                    continue;
+                }
+                tagged.insert(s);
+                if s.type_() == SymbolType::Error {
+                    costs.insert(s, cn.strength());
+                }
+            }
+        }
+
+        let edits = self.edits.iter().map(|(v, info)| ::tableau::EditView {
+            name: names.get(v).cloned().unwrap_or_else(
+                || format!("x{}", (self.var_data[v].1).0)),
+            value: info.constant,
+            strength: info.constraint.strength()
+        }).collect();
+
+        ::tableau::build(&self.rows,
+                         objective,
+                         artificial,
+                         &costs,
+                         &tagged,
+                         &self.var_for_symbol,
+                         names,
+                         &self.infeasible_rows,
+                         edits)
+    }
+}
